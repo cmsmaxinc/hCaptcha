@@ -30,12 +30,15 @@ class HCaptcha
     protected $http;
 
     /**
-     * The cached responses.
+     * The cached verified responses.
      *
      * @var array
      */
-    protected $cachedResponses = [];
-
+    protected $verifiedResponses = [];
+    
+    protected $lastScore = null;
+    
+    
     /**
      * HCaptcha.
      *
@@ -113,25 +116,7 @@ class HCaptcha
     {
         return '<script src="' . $this->getJsLink($lang, $callback, $onLoadClass) . '" async defer></script>' . "\n";
     }
-
-    /**
-     * Get the hCaptcha verification details for a given response
-     */
-    public function getResponseDetails(string $response): array
-    {
-        // A response can only be verified once from hCaptcha, so we need to
-        // cache it to make it work in case we want to verify it multiple times.
-        if (isset($this->cachedResponses[$response])) {
-            return $this->cachedResponse[$response];
-        }
-
-        return $this->cachedResponses[$response] = $this->sendRequestVerify([
-            'secret'   => $this->secret,
-            'response' => $response,
-            'remoteip' => $clientIp,
-        ]);
-    }
-
+    
     /**
      * Verify hCaptcha response.
      *
@@ -145,10 +130,20 @@ class HCaptcha
         if (empty($response)) {
             return false;
         }
-
-        $verifyResponse = $this->getResponseDetails($responce);
-
+        
+        // Return true if response already verfied before.
+        if (in_array($response, $this->verifiedResponses)) {
+            return true;
+        }
+        
+        $verifyResponse = $this->sendRequestVerify([
+            'secret'   => $this->secret,
+            'response' => $response,
+            'remoteip' => $clientIp,
+        ]);
+        
         if (isset($verifyResponse['success']) && $verifyResponse['success'] === true) {
+            $this->lastScore = isset($verifyResponse['score']) ? $verifyResponse['score'] : null;
             // Check score if it's enabled.
             $isScoreVerificationEnabled = config('HCaptcha.score_verification_enabled', false);
 
@@ -159,7 +154,10 @@ class HCaptcha
             if ($isScoreVerificationEnabled && $verifyResponse['score'] > config('HCaptcha.score_threshold', 0.7)) {
                 return false;
             }
-
+            
+            // A response can only be verified once from hCaptcha, so we need to
+            // cache it to make it work in case we want to verify it multiple times.
+            $this->verifiedResponses[] = $response;
             return true;
         } else {
             return false;
@@ -200,7 +198,17 @@ class HCaptcha
 
         return $client_api . '?' . http_build_query($params);
     }
-
+    
+    /**
+     * Get the score from the last successful hCaptcha verification.
+     *
+     * @return float|null The score of the last verification or null if not available.
+     */
+    public function getScoreFromLastVerification()
+    {
+        return $this->lastScore;
+    }
+    
     /**
      * @param $params
      * @param $onLoadClass
