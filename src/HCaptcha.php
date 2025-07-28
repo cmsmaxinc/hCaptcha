@@ -42,7 +42,6 @@ class HCaptcha
 
     /**
      * Cache of response verifications with timestamps
-     * @var array
      */
     protected array $responseCache = [];
 
@@ -61,6 +60,15 @@ class HCaptcha
         $this->sitekey = $sitekey;
         $this->http = new Client($options);
         $this->enabled = $enabled;
+    }
+    /**
+     * Get the score from the last successful hCaptcha verification.
+     *
+     * @return float|null The score of the last verification or null if not available.
+     */
+    public function getScoreFromLastVerification()
+    {
+        return $this->lastScore;
     }
 
     /**
@@ -438,16 +446,7 @@ class HCaptcha
             throw new \RuntimeException('Failed to verify hCaptcha response');
         }
     }
-
-    /**
-     * Get the score from the last successful hCaptcha verification.
-     *
-     * @return float|null The score of the last verification or null if not available.
-     */
-    public function getScoreFromLastVerification(): ?float
-    {
-        return $this->lastScore;
-    }
+    
 
     /**
      * Render HTML captcha.
@@ -629,7 +628,7 @@ class HCaptcha
         }
 
         $params = [
-            'secret' => $this->secret,
+            'secret'   => $this->secret,
             'response' => $response,
             'remoteip' => $clientIp,
         ];
