@@ -12,80 +12,69 @@ class HCaptcha
 
     /**
      * The hCaptcha secret key.
-     *
-     * @var string
      */
-    protected $secret;
+    protected string $secret;
 
     /**
      * The hCaptcha sitekey key.
-     *
-     * @var string
      */
-    protected $sitekey;
+    protected string $sitekey;
 
     /**
-     * @var \GuzzleHttp\Client
+     * The HTTP client used to send requests.
      */
-    protected $http;
+    protected \GuzzleHttp\Client $http;
 
     /**
      * The cached verified responses.
-     *
-     * @var array
      */
-    protected $verifiedResponses = [];
+    protected array $verifiedResponses = [];
 
     /**
-     * @var null
      * lastScore
      */
-    protected $lastScore = null;
+    protected ?float $lastScore = null;
 
     /**
      * Whether to use hCaptcha or not.
-     *
-     * @var bool
      */
-    protected $enabled;
+    protected bool $enabled;
 
     /**
      * Cache of response verifications with timestamps
-     * @var array
      */
-    protected $responseCache = [];
+    protected array $responseCache = [];
 
     /**
      * Cache duration in seconds
-     * @var int
      */
-    protected $cacheDuration = 120;
+    protected int $cacheDuration = 120;
 
 
     /**
      * HCaptcha constructor.
-     *
-     * @param string $secret
-     * @param string $sitekey
-     * @param array  $options
-     * @param bool   $enabled
      */
-    public function __construct($secret, $sitekey, $options = [], $enabled = true)
+    public function __construct(string $secret, string $sitekey, array $options = [], bool $enabled = true)
     {
         $this->secret = $secret;
         $this->sitekey = $sitekey;
         $this->http = new Client($options);
         $this->enabled = $enabled;
     }
-    
+    /**
+     * Get the score from the last successful hCaptcha verification.
+     *
+     * @return float|null The score of the last verification or null if not available.
+     */
+    public function getScoreFromLastVerification()
+    {
+        return $this->lastScore;
+    }
+
     /**
      * Get the hCaptcha verification details for a given response
-     *
-     * @param string $response
-     * @param string|null $clientIp
-     * @return array
      */
-    public function getResponseDetails(string $response, $clientIp = null): array
+    public function getResponseDetails(string $response, ?string $clientIp = null): array
     {
         if (!$this->enabled) {
             return [
@@ -106,7 +95,7 @@ class HCaptcha
 
         $verifyResponse = $this->getVerificationResponse($response, $clientIp, true);
 
-        // Store verification state if needed
+        // Store verification state
         if (isset($verifyResponse['success']) && $verifyResponse['success'] === true) {
             $this->lastScore = $verifyResponse['score'] ?? null;
             $this->verifiedResponses[] = $response;
@@ -116,63 +105,317 @@ class HCaptcha
     }
 
     /**
-     * Verify hCaptcha response.
-     *
-     * @param string $response
-     * @param string $clientIp
-     *
-     * @return bool
+     * Verify the hCaptcha response.
      */
-    public function verifyResponse($response, $clientIp = null)
+    public function verifyResponse(string $response, ?string $clientIp = null, ?bool $detailed = null)
     {
+        // Use config value if $detailed is not explicitly provided
+        if ($detailed === null) {
+            $detailed = function_exists('config') ? config('HCaptcha.validation_return_detailed', false) : false;
+        }
+
         if (!$this->enabled) {
+            if ($detailed) {
+                return [
+                    'allowed' => true,
+                    'action' => 'disabled',
+                    'message' => 'hCaptcha is disabled',
+                    'score' => null,
+                    'success' => true
+                ];
+            }
             return true; // Always true if hCaptcha is disabled
         }
 
         if (empty($response)) {
+            if ($detailed) {
+                return [
+                    'allowed' => false,
+                    'action' => 'missing_response',
+                    'message' => 'No hCaptcha response provided',
+                    'score' => null,
+                    'success' => false
+                ];
+            }
             return false;
         }
 
-        // Return true if response already verified before.
+        // Check for existing shadow ban first
+        $userId = $this->getUserIdFromIp($clientIp);
+        if ($userId && $this->isUserShadowBanned($userId)) {
+            $banDetails = $this->getShadowBanDetails($userId);
+            if ($detailed) {
+                return [
+                    'allowed' => false,
+                    'action' => 'shadow_ban',
+                    'message' => 'Your account has been temporarily restricted due to suspicious activity.',
+                    'score' => $banDetails['score'] ?? null,
+                    'success' => false,
+                    'ban_details' => $banDetails
+                ];
+            }
+            return false;
+        }
+
+        // Return cached result if response already verified before.
         if (in_array($response, $this->verifiedResponses)) {
+            if ($detailed) {
+                return [
+                    'allowed' => true,
+                    'action' => 'cached',
+                    'message' => 'Response already verified',
+                    'score' => $this->lastScore,
+                    'success' => true
+                ];
+            }
             return true;
         }
 
         $verifyResponse = $this->getVerificationResponse($response, $clientIp);
+        $success = isset($verifyResponse['success']) && $verifyResponse['success'] === true;
+        $score = isset($verifyResponse['score']) ? (float)$verifyResponse['score'] : null;
 
-        // First check: success must be true
-        if (!isset($verifyResponse['success']) || $verifyResponse['success'] !== true) {
+        $this->lastScore = $score;
+
+        // Enhanced score-based decision making
+        $result = $this->processScoreBasedDecision($success, $score, $clientIp);
+
+        if ($result['allowed']) {
+            $this->verifiedResponses[] = $response;
+        }
+
+        if ($detailed) {
+            return array_merge($result, [
+                'score' => $score,
+                'success' => $success,
+                'raw_response' => $verifyResponse
+            ]);
+        }
+
+        return $result['allowed'];
+    }
+
+    /**
+     * Process score-based decision according to hCaptcha recommended flow.
+     *
+     * Decision Matrix:
+     * | Success | Score | Action | Result |
+     * |---------|-------|--------|--------|
+     * | true | null | Session OK | ✅ Allow |
+     * | true | < 0.3 | Session OK | ✅ Allow |
+     * | true | 0.3-0.7 | Trigger Re-auth | ❌ Block + Re-auth |
+     * | true | ≥ 0.7 | Shadow Ban User | ❌ Block + Ban |
+     * | false | null | Request New Token | ❌ Block + New Token |
+     * | false | < 0.7 | Request New Token | ❌ Block + New Token |
+     * | false | ≥ 0.7 | Shadow Ban User | ❌ Block + Ban |
+     */
+    protected function processScoreBasedDecision(bool $success, ?float $score, ?string $clientIp = null): array
+    {
+        $scoreThreshold = function_exists('config') ? config('HCaptcha.score_threshold', 0.7) : 0.7;
+        $suspiciousThreshold = function_exists('config') ? config('HCaptcha.suspicious_score_threshold', 0.3) : 0.3;
+        $userId = $this->getUserIdFromIp($clientIp);
+
+        if ($success) {
+            if ($score === null) {
+                // Score missing - session OK
+                return [
+                    'allowed' => true,
+                    'action' => 'session_ok',
+                    'message' => null
+                ];
+            } elseif ($score >= $scoreThreshold) {
+                // Score is high - shadow ban user
+                $this->shadowBanUser($userId, $score);
+                return [
+                    'allowed' => false,
+                    'action' => 'shadow_ban',
+                    'message' => 'Your account has been temporarily restricted due to suspicious activity.'
+                ];
+            } elseif ($score >= $suspiciousThreshold) {
+                // Score is suspicious - trigger re-auth
+                return [
+                    'allowed' => false,
+                    'action' => 're_auth',
+                    'message' => 'Additional verification required. Please complete the challenge again.'
+                ];
+            } else {
+                // Score is low - session OK
+                return [
+                    'allowed' => true,
+                    'action' => 'session_ok',
+                    'message' => null
+                ];
+            }
+        } else {
+            if ($score === null || $score < $scoreThreshold) {
+                // Score missing or low - request new token
+                return [
+                    'allowed' => false,
+                    'action' => 'new_token',
+                    'message' => 'Please complete the captcha challenge again.'
+                ];
+            } else {
+                // Score is high but success is false - shadow ban user
+                $this->shadowBanUser($userId, $score);
+                return [
+                    'allowed' => false,
+                    'action' => 'shadow_ban',
+                    'message' => 'Your account has been temporarily restricted due to suspicious activity.'
+                ];
+            }
+        }
+    }
+
+    /**
+     * Check if a user is shadow banned before form submission
+     * This can be called before displaying forms or processing submissions
+     */
+    public function checkShadowBan(?string $clientIp = null, ?bool $detailed = null): bool|array
+    {
+        // Use config value if $detailed is not explicitly provided
+        if ($detailed === null) {
+            $detailed = function_exists('config') ? config('HCaptcha.validation_return_detailed', false) : false;
+        }
+
+        if (!$this->enabled) {
+            return $detailed ? [
+                'banned' => false,
+                'action' => 'disabled',
+                'message' => 'hCaptcha is disabled'
+            ] : false;
+        }
+
+        $userId = $this->getUserIdFromIp($clientIp);
+        if ($userId && $this->isUserShadowBanned($userId)) {
+            $banDetails = $this->getShadowBanDetails($userId);
+            if ($detailed) {
+                return [
+                    'banned' => true,
+                    'action' => 'shadow_ban',
+                    'message' => 'Your account has been temporarily restricted due to suspicious activity.',
+                    'ban_details' => $banDetails,
+                    'expires_at' => $banDetails['expires_at'] ?? null
+                ];
+            }
+            return true;
+        }
+
+        return $detailed ? [
+            'banned' => false,
+            'action' => 'allowed',
+            'message' => null
+        ] : false;
+    }
+
+    /**
+     * Get user ID from IP address (can be overridden in child classes)
+     */
+    protected function getUserIdFromIp(?string $clientIp = null): ?string
+    {
+        return $clientIp ? 'ip_' . $clientIp : null;
+    }
+
+    /**
+     * Shadow ban a user due to high hCaptcha score
+     */
+    public function shadowBanUser(?string $userId, float $score): void
+    {
+        if (!$userId || (function_exists('config') && !config('HCaptcha.enable_shadow_banning', true))) {
+            return;
+        }
+
+        $banKey = "hcaptcha_shadow_banned_{$userId}";
+        $banDuration = function_exists('config') ? config('HCaptcha.shadow_ban_duration', 86400): 86400; // 24 hours default
+
+        if (function_exists('cache')) {
+            $now = function_exists('now') ? now() : new \DateTime();
+            $bannedAt = $now instanceof \DateTime ? $now->format('c') : $now->toISOString();
+            $expiresAt = function_exists('now') ? $now->addSeconds($banDuration)->toISOString() : date('c', time() + $banDuration);
+
+            cache()->put($banKey, [
+                'score' => $score,
+                'banned_at' => $bannedAt,
+                'expires_at' => $expiresAt
+            ], $banDuration);
+
+            // Track shadow ban keys for admin management
+            $keys = cache()->get('hcaptcha_shadow_ban_keys', []);
+            if (!in_array($banKey, $keys)) {
+                $keys[] = $banKey;
+                cache()->put('hcaptcha_shadow_ban_keys', $keys);
+            }
+        }
+
+        // Log the shadow ban if detailed logging is enabled
+        if (function_exists('logger') && config('HCaptcha.enable_detailed_logging', true)) {
+            logger()->warning("User {$userId} shadow banned due to high hCaptcha score: {$score}", [
+                'user_id' => $userId,
+                'score' => $score,
+                'banned_until' => now()->addSeconds($banDuration)->toISOString()
+            ]);
+        }
+    }
+
+    /**
+     * Check if a user is shadow banned
+     */
+    public function isUserShadowBanned(?string $userId = null): bool
+    {
+        if (!$userId) {
             return false;
         }
 
-        $this->lastScore = isset($verifyResponse['score']) ? $verifyResponse['score'] : null;
-
-        // Score verification if enabled
-        $isScoreVerificationEnabled = config('HCaptcha.score_verification_enabled', false);
-        if ($isScoreVerificationEnabled) {
-            if (!array_key_exists('score', $verifyResponse)) {
-                throw new \RuntimeException('Score Verification is an exclusive Enterprise feature! Moreover, make sure you are sending the remoteip in your request payload!');
-            }
-
-            $score = (float) $verifyResponse['score'];
-
-            if ($score > config('HCaptcha.score_threshold', 0.7)) {
-                return false;
-            }
+        if (function_exists('cache')) {
+            return cache()->has("hcaptcha_shadow_banned_{$userId}");
         }
 
-        $this->verifiedResponses[] = $response;
-        return true;
+        return false;
+    }
+
+    /**
+     * Get shadow ban details for a user
+     */
+    public function getShadowBanDetails(?string $userId = null): ?array
+    {
+        if (!$userId) {
+            return null;
+        }
+
+        if (function_exists('cache')) {
+            return cache()->get("hcaptcha_shadow_banned_{$userId}");
+        }
+
+        return null;
+    }
+
+    /**
+     * Remove shadow ban for a user
+     */
+    public function removeShadowBan(?string $userId = null): void
+    {
+        if (!$userId) {
+            return;
+        }
+
+        if (function_exists('cache')) {
+            $banKey = "hcaptcha_shadow_banned_{$userId}";
+            cache()->forget($banKey);
+
+            // Remove from keys list
+            $keys = cache()->get('hcaptcha_shadow_ban_keys', []);
+            $keys = array_diff($keys, [$banKey]);
+            cache()->put('hcaptcha_shadow_ban_keys', $keys);
+        }
+
+        if (function_exists('logger') && config('HCaptcha.enable_detailed_logging', true)) {
+            logger()->info("Shadow ban removed for user {$userId}");
+        }
     }
 
     /**
      * Verify hCaptcha response by Symfony Request.
-     *
-     * @param Request $request
-     *
-     * @return bool
      */
-    public function verifyRequest(Request $request)
+    public function verifyRequest(Request $request): bool
     {
         return $this->verifyResponse(
             $request->get('h-captcha-response'),
@@ -182,13 +425,8 @@ class HCaptcha
 
     /**
      * Send verify request.
-     *
-     * @param array $query
-     *
-     * @return array
-     * @throws \RuntimeException
      */
-    protected function sendRequestVerify(array $query = [])
+    protected function sendRequestVerify(array $query = []): array
     {
         try {
             $response = $this->http->request('POST', static::VERIFY_URL, [
@@ -208,25 +446,12 @@ class HCaptcha
             throw new \RuntimeException('Failed to verify hCaptcha response');
         }
     }
-
-    /**
-     * Get the score from the last successful hCaptcha verification.
-     *
-     * @return float|null The score of the last verification or null if not available.
-     */
-    public function getScoreFromLastVerification()
-    {
-        return $this->lastScore;
-    }
+    
 
     /**
      * Render HTML captcha.
-     *
-     * @param array $attributes
-     *
-     * @return string
      */
-    public function display($attributes = [])
+    public function display($attributes = []): string
     {
         if (!$this->enabled) {
             return '';
@@ -239,7 +464,7 @@ class HCaptcha
     /**
      * @see display()
      */
-    public function displayWidget($attributes = [])
+    public function displayWidget($attributes = []): string
     {
         return $this->display($attributes);
     }
@@ -248,12 +473,12 @@ class HCaptcha
      * Display a Invisible hCaptcha by embedding a callback into a form submit button.
      *
      * @param string $formIdentifier the html ID of the form that should be submitted.
-     * @param string $text           the text inside the form button
-     * @param array  $attributes     array of additional html elements
+     * @param string $text the text inside the form button
+     * @param array $attributes array of additional html elements
      *
      * @return string
      */
-    public function displaySubmit($formIdentifier, $text = 'submit', $attributes = [])
+    public function displaySubmit(string $formIdentifier, string $text = 'submit', array $attributes = []): string
     {
         if (!$this->enabled) {
             return sprintf('<button%s><span>%s</span></button>', $this->buildAttributes($attributes), $text);
@@ -279,13 +504,13 @@ class HCaptcha
     /**
      * Render js source
      *
-     * @param null   $lang
-     * @param bool   $callback
+     * @param null $lang
+     * @param bool $callback
      * @param string $onLoadClass
      *
      * @return string
      */
-    public function renderJs($lang = null, $callback = false, $onLoadClass = 'onloadCallBack')
+    public function renderJs($lang = null, $callback = false, $onLoadClass = 'onloadCallBack'): string
     {
         if (!$this->enabled) {
             return '';
@@ -297,13 +522,13 @@ class HCaptcha
     /**
      * Get hCaptcha js link.
      *
-     * @param string  $lang
+     * @param string $lang
      * @param boolean $callback
-     * @param string  $onLoadClass
+     * @param string $onLoadClass
      *
      * @return string
      */
-    public function getJsLink($lang = null, $callback = false, $onLoadClass = 'onloadCallBack')
+    public function getJsLink($lang = null, $callback = false, $onLoadClass = 'onloadCallBack'): string
     {
         if (!$this->enabled) {
             return '';
@@ -322,7 +547,7 @@ class HCaptcha
      * @param $params
      * @param $onLoadClass
      */
-    protected function setCallBackParams(&$params, $onLoadClass)
+    protected function setCallBackParams(&$params, $onLoadClass): void
     {
         $params['render'] = 'explicit';
         $params['onload'] = $onLoadClass;
@@ -335,7 +560,7 @@ class HCaptcha
      *
      * @return array
      */
-    protected function prepareAttributes(array $attributes)
+    protected function prepareAttributes(array $attributes): array
     {
         $attributes['data-sitekey'] = $this->sitekey;
         if (!isset($attributes['class'])) {
@@ -353,7 +578,7 @@ class HCaptcha
      *
      * @return string
      */
-    protected function buildAttributes(array $attributes)
+    protected function buildAttributes(array $attributes): string
     {
         $html = [];
 
@@ -366,9 +591,6 @@ class HCaptcha
 
     /**
      * Get cached response if valid, or null if not found/expired
-     *
-     * @param string $response
-     * @return array|null
      */
     private function getCachedResponse(string $response): ?array
     {
@@ -385,10 +607,6 @@ class HCaptcha
 
     /**
      * Cache a verification response
-     *
-     * @param string $response
-     * @param array $verifyResponse
-     * @return void
      */
     private function cacheResponse(string $response, array $verifyResponse): void
     {
@@ -400,11 +618,6 @@ class HCaptcha
 
     /**
      * Get verification response, either from cache or fresh API call
-     *
-     * @param string $response
-     * @param string|null $clientIp
-     * @param bool $includeSitekey
-     * @return array
      */
     private function getVerificationResponse(string $response, ?string $clientIp, bool $includeSitekey = false): array
     {
@@ -413,7 +626,7 @@ class HCaptcha
         if ($cachedResponse !== null) {
             return $cachedResponse;
         }
-        
+
         $params = [
             'secret'   => $this->secret,
             'response' => $response,
@@ -423,7 +636,7 @@ class HCaptcha
         if ($includeSitekey) {
             $params['sitekey'] = $this->sitekey;
         }
-        
+
         $verifyResponse = $this->sendRequestVerify($params);
 
         // Cache the response
