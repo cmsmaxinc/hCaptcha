@@ -317,7 +317,7 @@ class HCaptcha
         }
 
         $banKey = "hcaptcha_shadow_banned_{$userId}";
-        $banDuration = config('HCaptcha.shadow_ban_duration', 86400); // 24 hours default
+        $banDuration = function_exists('config') ? config('HCaptcha.shadow_ban_duration', 86400): 86400; // 24 hours default
 
         if (function_exists('cache')) {
             $now = function_exists('now') ? now() : new \DateTime();
