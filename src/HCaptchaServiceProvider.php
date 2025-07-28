@@ -21,9 +21,16 @@ class HCaptchaServiceProvider extends ServiceProvider
         $app = $this->app;
 
         $this->bootConfig();
-
+        
         $app['validator']->extend('HCaptcha', function ($attribute, $value) use ($app) {
-            return $app['HCaptcha']->verifyResponse($value, $app['request']->getClientIp());
+            $result = $app['HCaptcha']->verifyResponse($value, $app['request']->getClientIp());
+            return is_array($result) ? $result['allowed'] : $result;
+        });
+
+        // Shadow ban validation rule
+        $app['validator']->extend('shadowBan', function ($attribute, $value, $parameters, $validator) use ($app) {
+            $banCheck = $app['HCaptcha']->checkShadowBan($app['request']->getClientIp(), true);
+            return !$banCheck['banned'];
         });
 
         if ($app->bound('form')) {
